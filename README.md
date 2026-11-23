@@ -77,5 +77,31 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 版式复跑包
+
+外地复查只有结果、无法复现抽取时，用版式复跑包把「页 + 区域 + 确认依据」导出成
+可离线复跑的 ZIP。
+
+- 版本库：`app/services/layout_revision.py`，按页追加不可变修订；区域更正只生成新页修订，
+  同一页的页记录、区域集合和确认依据永远来自同一修订。
+- 范围：`POST /api/layout-rerun/documents/{doc_id}/seed` 从解析/版式还原产物建档，
+  `PUT .../pages/{page}` 更正区域或确认，`POST /api/layout-rerun/packages` 导出。
+- 包内容：`manifest.json`（所选页、可立即复跑页、未确认页、批次表格数、是否覆盖整份、
+  离线命令）、`pages.json`（逐页页校验和与区域校验和）、`evidence.json`（逐页逐区域的
+  确认时间、确认人、来源与校验和）、`README.md`、`rerun.py`。
+- 导出先取一次快照再写 ZIP，与区域更新并发时包内每一页仍自洽；旧包重开仍复现导出时的修订。
+- 离线执行（`rerun.py` 只依赖标准库）：
+  ```bash
+  python3 rerun.py verify .                                   # 校验清单/页/区域/确认依据
+  python3 rerun.py rerun . --out ./rerun-output                # 按页复跑，未确认页跳过
+  python3 rerun.py extract-tables . --out ./cells.jsonl        # 逐单元格输出，可逐页对照
+  ```
+  `extract-tables` 默认只抽已确认页，未确认页列在 `skipped_unconfirmed_pages`；
+  加 `--include-unconfirmed` 可把未确认页一起导出。
+- 表格抽取服务同样直接消费包：`TableExtractService.extract_from_package(...)` 或
+  `POST /api/layout-rerun/packages/{package_id}/table-extract`，单元格带页码、页修订、
+  确认依据、表格区域号和行列坐标。
+- 前端入口：`/layout-rerun`（`frontend/src/views/LayoutRerunView.vue`）。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

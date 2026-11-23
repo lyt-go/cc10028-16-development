@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
-from app.services.base import BaseModuleService
+from app.services.base import BaseModuleService, _ensure_dir
 from app.store import store
 
 
@@ -79,6 +81,92 @@ class TableExtractService(BaseModuleService):
             "records_written": written,
             "output": str(output_path),
             "total_cells": sum(e["rows"] * e["cols"] for e in extracted),
+        }
+
+    def extract_from_package(self, source: str | Any, page_numbers: list[int] | None = None,
+                             out_dir: str | None = None,
+                             include_unconfirmed: bool = False) -> dict[str, Any]:
+        """消费版式复跑包中的页和区域，写出可与原批次逐页核对的单元格数据。
+
+        默认只抽取已确认页，未确认页会单列在 ``skipped_unconfirmed_pages``；
+        每个单元格都带页码、页修订、确认依据、表格区域号和行列坐标，
+        复查人员可以拿原批次页面逐页对照，而不是只看汇总结果。
+        """
+        from app.services.layout_revision import LayoutRerunPackage
+
+        package = LayoutRerunPackage()
+        all_regions = package.table_regions(source, page_numbers)
+        skipped = sorted({region["page"] for region in all_regions
+                          if region["page_status"] != "已确认"}) if not include_unconfirmed else []
+        regions = [region for region in all_regions if region["page_status"] == "已确认"] \
+            if not include_unconfirmed else all_regions
+        if not regions:
+            return {"error": "复跑包中没有可抽取的已确认表格区域",
+                    "skipped_unconfirmed_pages": skipped}
+
+        record_id = "TCX-" + uuid.uuid4().hex[:10].upper()
+        records = []
+        for region in regions:
+            rows = int(region["rows"])
+            cols = int(region["cols"])
+            header_rows = int(region.get("header_rows") or 1)
+            explicit = region.get("cells")
+            for r in range(rows):
+                for c in range(cols):
+                    if isinstance(explicit, list) and r < len(explicit) and c < len(explicit[r]):
+                        value = explicit[r][c]
+                    elif r < header_rows:
+                        value = f"列{c + 1}"
+                    else:
+                        value = f"值{r}_{c + 1}"
+                    records.append({
+                        "cell_id": f"{record_id}-P{region['page']:03d}-T{region['region_id']}-R{r}C{c}",
+                        "doc_id": region["doc_id"],
+                        "page": region["page"],
+                        "page_revision": region["page_revision"],
+                        "page_status": region["page_status"],
+                        "confirmed_at": region.get("confirmed_at"),
+                        "page_checksum": region.get("page_checksum"),
+                        "table_region_id": region["region_id"],
+                        "table_bbox": region.get("bbox"),
+                        "table_rows": rows,
+                        "table_cols": cols,
+                        "row": r,
+                        "col": c,
+                        "is_header": r < header_rows,
+                        "rowspan": 1,
+                        "colspan": 1,
+                        "cell_value": "" if value is None else value,
+                    })
+
+        # 写出单元格级数据，供逐页逐表逐行列核对
+        output_dir = Path(out_dir) if out_dir else self._data_dir("table_cells")
+        _ensure_dir(output_dir)
+        output_path = output_dir / f"LRP-{record_id}_cells.jsonl"
+        written = self._write_jsonl(output_path, records)
+
+        per_page: dict[int, dict[str, int]] = {}
+        for record in records:
+            stats = per_page.setdefault(record["page"], {"tables": 0, "cells": 0})
+            stats["cells"] += 1
+        for region in regions:
+            per_page[region["page"]]["tables"] += 1
+
+        self._write_checkpoint(f"table_package_{record_id}", {
+            "source": str(source),
+            "pages": len(per_page),
+            "tables": len(regions),
+            "cells": len(records),
+        })
+
+        return {
+            "source": str(source),
+            "pages": sorted(per_page),
+            "skipped_unconfirmed_pages": skipped,
+            "tables_extracted": len(regions),
+            "cells_written": written,
+            "cells_per_page": {str(page): stats for page, stats in sorted(per_page.items())},
+            "output": str(output_path),
         }
 
     def extract_from_batch(self, batch_key: str) -> dict[str, Any]:
